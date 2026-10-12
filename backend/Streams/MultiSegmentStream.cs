@@ -2405,7 +2405,8 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ISegmentIssuePr
         else if (!inconclusive)
             Par2RepairTriggerSink.Current?.ReportZeroFill(_fileName, segmentId, segmentIndex, fill);
 
-        PlaybackHoleTracker.RecordHole(_fileName, segmentId, exception);
+        // Counted toward consecutive fail-fast when the reader consumes it, in read order.
+        PlaybackHoleTracker.RecordDiscoveredHole(_fileName, segmentId, exception);
 
 #pragma warning disable CA2000 // gap-fill stream ownership transfers to the returned SegmentDownloadResult
         return SegmentDownloadResult.ZeroFill(
@@ -2589,7 +2590,8 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ISegmentIssuePr
                             _segmentSizes.RecordObservedSize(segmentIndex, drainedBytes);
                         else if (drainedBytes < exactSize && !IsSuperseded(segmentIndex))
                             SegmentHoleReporter.ReportShortDecode(
-                                _fileName, incrementalSegmentId, segmentIndex, exactSize - drainedBytes);
+                                _fileName, incrementalSegmentId, segmentIndex, exactSize - drainedBytes,
+                                readerIsPadding: false);
                         if (length != estimate)
                             incrementalLease.Adjust(length - estimate);
                     },
@@ -2754,7 +2756,7 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ISegmentIssuePr
         var shortfall = expected - drained;
         var segmentId = _segmentIds.Span[segmentIndex];
         if (reportShortDecode && !IsSuperseded(segmentIndex))
-            SegmentHoleReporter.ReportShortDecode(_fileName, segmentId, segmentIndex, shortfall);
+            SegmentHoleReporter.ReportShortDecode(_fileName, segmentId, segmentIndex, shortfall, readerIsPadding: false);
         buffer.SetLength(expected);
         return true;
     }
@@ -3302,6 +3304,8 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ISegmentIssuePr
             if (result.IsShortPad)
             {
                 _consecutiveZeroFills++;
+                var hole = new UsenetArticleNotFoundException(result.SegmentId ?? _segmentIds.Span[0]);
+                PlaybackHoleTracker.RecordFilledHole(_fileName, hole);
                 if (_consecutiveZeroFills < PlaybackHoleTracker.ConsecutiveFillLimit(_fileName)
                     && !PlaybackHoleTracker.ShouldFailFast(_fileName, out _))
                     return;
@@ -3313,7 +3317,7 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ISegmentIssuePr
                     ExceptionDispatchInfo.Capture(failFast).Throw();
                 }
 
-                throw new UsenetArticleNotFoundException(result.SegmentId ?? _segmentIds.Span[0]);
+                throw hole;
             }
 
             _consecutiveZeroFills = 0;
@@ -3322,6 +3326,7 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ISegmentIssuePr
         }
 
         _consecutiveZeroFills++;
+        PlaybackHoleTracker.RecordFilledHole(_fileName, result.Failure!);
         ZeroFillLogLimiter.Write(
             result.MessageTemplate!,
             result.SegmentId!,
