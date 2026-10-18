@@ -170,6 +170,7 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
     private readonly TimeProvider _timeProvider;
     private readonly HealthWorkSchedulePolicy? _healthWorkSchedule;
     private readonly HealthCheckConnectionGate _healthCheckConnectionGate;
+    private readonly ActiveReadRegistry _activeReads;
     private readonly ConcurrentDictionary<Guid, InProgressHealthCheck> _inProgress = new();
     private const int RecentHealthCheckCapacity = 32;
     private readonly ConcurrentQueue<HealthCheckAttemptSnapshot> _recentHealthChecks = new();
@@ -277,7 +278,8 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
         IDbContextFactory<DavDatabaseContext>? dbContextFactory = null,
         TimeProvider? timeProvider = null,
         HealthWorkSchedulePolicy? healthWorkSchedule = null,
-        ArrInstanceBackoff? arrBackoff = null
+        ArrInstanceBackoff? arrBackoff = null,
+        ActiveReadRegistry? activeReadRegistry = null
     )
     {
         _configManager = configManager;
@@ -292,6 +294,7 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
         _repairPatchStore = repairPatchStore;
         _dbContextFactory = dbContextFactory;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _activeReads = activeReadRegistry ?? new ActiveReadRegistry();
         _healthWorkSchedule = healthWorkSchedule;
         _healthCheckConnectionGate = healthCheckConnectionGate;
 
@@ -3076,6 +3079,11 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
         /// InfiniDysk. The containers may expose the same host directory under different paths.
         /// </summary>
         DeferRootPathMismatch,
+        /// <summary>
+        /// A playback read began while Arr ownership was being resolved, so remove-and-blocklist
+        /// was not requested.
+        /// </summary>
+        DeferRecentRead,
     }
 
     internal sealed record ArrLinkedRepairResult(
@@ -3127,7 +3135,8 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
         CancellationToken ct,
         Func<ArrClient, IReadOnlyList<string>, bool>? shouldRequestSearch = null,
         ArrInstanceBackoff? arrBackoff = null,
-        Guid? legacyDownloadId = null)
+        Guid? legacyDownloadId = null,
+        Func<bool>? isDestructiveRepairHeld = null)
     {
         var anInstanceFailed = false;
         var sawConfiguredClient = false;
@@ -3272,6 +3281,14 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
             {
                 sawMissingIdentity = true;
                 continue;
+            }
+
+            if (isDestructiveRepairHeld?.Invoke() == true)
+            {
+                return new ArrLinkedRepairResult(
+                    ArrLinkedRepairDecision.DeferRecentRead,
+                    recoveredConflict || sawAmbiguousIdentity ? null : recoveredDownloadId,
+                    recoveryHost);
             }
 
             ArrRepairOutcome repairOutcome;
@@ -3523,8 +3540,55 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
         int? streamingFailureCount = null,
         long? providerGeneration = null)
     {
+        var readHold = _configManager.GetRepairReadHold();
+        DateTimeOffset? GetReadHoldUntil()
+        {
+            if (readHold <= TimeSpan.Zero
+                || _activeReads.GetLastFileReadAt(davItem.Id) is not { } observedReadAt)
+                return null;
+            var holdUntil = observedReadAt + readHold;
+            return holdUntil > _timeProvider.GetUtcNow() ? holdUntil : null;
+        }
+
+        async Task DeferForRecentReadAsync(DateTimeOffset resumeAt)
+        {
+            var repairNow = _timeProvider.GetUtcNow();
+            await using var mutationGate = await _failureTracker
+                .AcquireMutationGateAsync(davItem.Id, ct)
+                .ConfigureAwait(false);
+            if (await IsDurablyUrgentAsync(dbClient, davItem.Id, ct).ConfigureAwait(false))
+                davItem.NextHealthCheck = DateTimeOffset.UnixEpoch;
+
+            var retryAt = _repairRetryNotBefore.AddOrUpdate(
+                davItem.Id,
+                resumeAt,
+                (_, current) => current >= resumeAt ? current : resumeAt);
+            davItem.LastHealthCheck = repairNow;
+            davItem.NextHealthCheck = NextHealthCheckAfterScheduleDeferral(
+                davItem.NextHealthCheck, retryAt);
+            Log.Information(
+                "Destructive health repair deferred for DavItem {DavItemId} until {RetryAt}. Reason: recent playback read.",
+                davItem.Id,
+                retryAt);
+            await RecordHealthResult(
+                dbClient,
+                davItem,
+                HealthCheckResult.HealthResult.Unhealthy,
+                HealthCheckResult.RepairAction.ActionNeeded,
+                $"Removal and replacement deferred after a recent playback read. Earliest retry: {retryAt:u}.",
+                ct,
+                repairPending: true).ConfigureAwait(false);
+        }
+
+        DateTimeOffset? heldUntil = null;
         try
         {
+            if (GetReadHoldUntil() is { } initialHoldUntil)
+            {
+                await DeferForRecentReadAsync(initialHoldUntil).ConfigureAwait(false);
+                return;
+            }
+
             // if the file pattern has been marked as ignored,
             // then don't bother trying to repair it. We can simply delete it.
             var blocklistedFiles = _configManager.GetBlocklistedFiles();
@@ -3694,7 +3758,8 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
                     arrConfig.EffectiveQueueReplacementSearchLimit(),
                     arrConfig.EffectiveQueueReplacementSearchWindow()),
                 _arrBackoff,
-                legacyDownloadId: davItem.NzbBlobId ?? davItem.HistoryItemId).ConfigureAwait(false);
+                legacyDownloadId: davItem.NzbBlobId ?? davItem.HistoryItemId,
+                isDestructiveRepairHeld: () => (heldUntil = GetReadHoldUntil()) is not null).ConfigureAwait(false);
 
             if (davItem.ArrDownloadId is null && arrResult.RecoveredDownloadId is { } recovered)
             {
@@ -3706,6 +3771,12 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
             }
 
             var arrDecision = arrResult.Decision;
+
+            if (arrDecision == ArrLinkedRepairDecision.DeferRecentRead && heldUntil is { } lateHoldUntil)
+            {
+                await DeferForRecentReadAsync(lateHoldUntil).ConfigureAwait(false);
+                return;
+            }
 
             if (arrDecision is ArrLinkedRepairDecision.MediaRemovedBlocklistUnconfirmed
                 or ArrLinkedRepairDecision.MediaRemovedBlocklistConfirmedSearchUnconfirmed)
