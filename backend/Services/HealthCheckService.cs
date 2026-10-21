@@ -48,6 +48,9 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
     internal static readonly TimeSpan HealthCheckInactivityLimit = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan HealthCheckStallDeferral = TimeSpan.FromDays(1);
     private readonly ConcurrentDictionary<Guid, DateTimeOffset> _repairRetryNotBefore = new();
+    // Forced rechecks requested by playback (next-episode check). They are selected ahead of
+    // the ordered queue and admitted even while the health-check schedule window is closed.
+    private readonly ConcurrentDictionary<Guid, byte> _priorityRecheckIds = new();
 
     // Repeated remove-and-blocklist repairs for the same library path in a short window indicate
     // a replacement loop (Arr keeps re-grabbing a release repair keeps rejecting, issue #732).
@@ -214,7 +217,8 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
 
     public enum FileRecheckOutcome { Queued, AlreadyQueued, AlreadyRunning, NotFound, Unsupported, Disabled }
 
-    public async Task<FileRecheckOutcome> QueueFileRecheckAsync(Guid davItemId, CancellationToken cancellationToken)
+    public async Task<FileRecheckOutcome> QueueFileRecheckAsync(
+        Guid davItemId, CancellationToken cancellationToken, bool priority = false)
     {
         await _workerAdmissionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -225,8 +229,17 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
             if (item is null || !item.Path.StartsWith("/content/", StringComparison.Ordinal)) return FileRecheckOutcome.NotFound;
             if (item.Type != DavItem.ItemType.UsenetFile || !FilenameUtil.IsHealthCheckCandidate(item.Name)) return FileRecheckOutcome.Unsupported;
             if (_inProgress.ContainsKey(davItemId)) return FileRecheckOutcome.AlreadyRunning;
-            if (item.HealthRepairPending || item.NextHealthCheck == null || item.NextHealthCheck == DateTimeOffset.UnixEpoch || item.NextHealthCheck == ForcedRecheckSentinel)
+            if (item.HealthRepairPending || item.NextHealthCheck == DateTimeOffset.UnixEpoch)
                 return FileRecheckOutcome.AlreadyQueued;
+            if (item.NextHealthCheck == null || item.NextHealthCheck == ForcedRecheckSentinel)
+            {
+                if (priority)
+                {
+                    _priorityRecheckIds[davItemId] = 0;
+                    SignalWorkerStateChanged();
+                }
+                return FileRecheckOutcome.AlreadyQueued;
+            }
             var updated = await context.Items.Where(file => file.Id == davItemId && file.Type == DavItem.ItemType.UsenetFile)
                 .Where(file => !file.HealthRepairPending)
                 .Where(file => file.NextHealthCheck != null)
@@ -237,6 +250,7 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
             if (updated == 0)
                 return await context.Items.AnyAsync(file => file.Id == davItemId, cancellationToken).ConfigureAwait(false)
                     ? FileRecheckOutcome.AlreadyQueued : FileRecheckOutcome.NotFound;
+            if (priority) _priorityRecheckIds[davItemId] = 0;
             SignalWorkerStateChanged();
             return FileRecheckOutcome.Queued;
         }
@@ -408,7 +422,7 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
                         NextRepairsChange: null,
                         TimeZoneId: TimeZoneInfo.Local.Id,
                         ManualRunActive: false);
-                if (!admission.ChecksOpen && !admission.RepairsOpen)
+                if (!admission.ChecksOpen && !admission.RepairsOpen && _priorityRecheckIds.IsEmpty)
                     return HealthCheckRefillOutcome.Blocked;
 
                 // Preserve current-main admission semantics: do not start another library check
@@ -521,6 +535,10 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
 
         await using var dbContext = CreateContext();
         var dbClient = new DavDatabaseClient(dbContext);
+        var selected = await SelectPriorityRecheckIdsAsync(dbContext, activeIds, maximumCount, ct)
+            .ConfigureAwait(false);
+        if (selected.Count == maximumCount || (!allowChecks && !allowRepairs)) return selected;
+
         var currentDateTime = _timeProvider.GetUtcNow();
         IQueryable<DavItem> queue = GetHealthCheckQueueItems(dbClient)
             .Where(item =>
@@ -530,12 +548,12 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
         if (activeIds.Count > 0)
             queue = queue.Where(item => !activeIds.Contains(item.Id));
 
-        var selected = new List<Guid>(maximumCount);
         await foreach (var item in queue
             .AsAsyncEnumerable()
             .WithCancellation(ct)
             .ConfigureAwait(false))
         {
+            if (selected.Contains(item.Id)) continue;
             if (_repairRetryNotBefore.TryGetValue(item.Id, out var notBefore))
             {
                 if (notBefore > currentDateTime) continue;
@@ -549,6 +567,42 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
                 selected.Add(item.Id);
                 if (selected.Count == maximumCount) break;
             }
+        }
+
+        return selected;
+    }
+
+    private async Task<List<Guid>> SelectPriorityRecheckIdsAsync(
+        DavDatabaseContext dbContext,
+        HashSet<Guid> activeIds,
+        int maximumCount,
+        CancellationToken ct)
+    {
+        var selected = new List<Guid>(maximumCount);
+        if (_priorityRecheckIds.IsEmpty) return selected;
+
+        var pendingIds = _priorityRecheckIds.Keys.Where(id => !activeIds.Contains(id)).ToList();
+        var stillQueued = await dbContext.Items.AsNoTracking()
+            .Where(item => pendingIds.Contains(item.Id) && item.Type == DavItem.ItemType.UsenetFile)
+            .Where(item => !item.HealthRepairPending)
+            .Where(item => item.NextHealthCheck == null || item.NextHealthCheck == ForcedRecheckSentinel)
+            .Select(item => new { item.Id, item.Name })
+            .ToListAsync(ct)
+            .ConfigureAwait(false);
+        var queuedIds = stillQueued
+            .Where(item => FilenameUtil.IsHealthCheckCandidate(item.Name))
+            .Select(item => item.Id)
+            .ToHashSet();
+
+        foreach (var id in pendingIds)
+        {
+            if (queuedIds.Contains(id))
+            {
+                if (selected.Count == maximumCount) continue;
+                selected.Add(id);
+            }
+            // Selected, already checked, removed, or escalated to repair: no longer a priority.
+            _priorityRecheckIds.TryRemove(id, out _);
         }
 
         return selected;

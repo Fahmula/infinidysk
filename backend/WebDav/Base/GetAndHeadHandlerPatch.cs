@@ -40,6 +40,7 @@ public class GetAndHeadHandlerPatch : IRequestHandler
     private readonly StreamingFailureTracker _failureTracker;
     private readonly SharedStreamRegistry _sharedStreams;
     private readonly InFlightArticleBudget? _inFlightArticleBudget;
+    private readonly NextEpisodeHealthCheckService? _nextEpisodeCheck;
 
     public GetAndHeadHandlerPatch(
         IStore store,
@@ -50,7 +51,8 @@ public class GetAndHeadHandlerPatch : IRequestHandler
         StreamTraceBuffer streamTrace,
         StreamingFailureTracker failureTracker,
         SharedStreamRegistry sharedStreams,
-        InFlightArticleBudget? inFlightArticleBudget = null)
+        InFlightArticleBudget? inFlightArticleBudget = null,
+        NextEpisodeHealthCheckService? nextEpisodeCheck = null)
     {
         _store = store;
         _configManager = configManager;
@@ -61,6 +63,7 @@ public class GetAndHeadHandlerPatch : IRequestHandler
         _failureTracker = failureTracker;
         _sharedStreams = sharedStreams;
         _inFlightArticleBudget = inFlightArticleBudget ?? InFlightArticleBudget.Current;
+        _nextEpisodeCheck = nextEpisodeCheck;
     }
 
     /// <summary>
@@ -309,8 +312,8 @@ public class GetAndHeadHandlerPatch : IRequestHandler
                         userAgent, clientIp);
                     _activeReadRegistry.UpdateInfo(sessionId, fileName, stream.CanSeek ? stream.Length : null,
                         (httpContext.Items["DavItem"] as NzbWebDAV.Database.Models.DavItem)?.Path);
-                    var davItemId =
-                        (httpContext.Items["DavItem"] as NzbWebDAV.Database.Models.DavItem)?.Id;
+                    var davItem = httpContext.Items["DavItem"] as NzbWebDAV.Database.Models.DavItem;
+                    var davItemId = davItem?.Id;
                     _activeReadRegistry.RecordFileRead(davItemId);
                     var traceRange = _streamTrace.RangeOpen(
                         sessionId, path, request.Method, copyStart, copyEnd,
@@ -335,6 +338,8 @@ public class GetAndHeadHandlerPatch : IRequestHandler
                                 rangeBytesServed += bytes;
                                 _activeReadRegistry.Touch(sessionId, bytes, position);
                                 _activeReadRegistry.RecordFileRead(davItemId);
+                                _nextEpisodeCheck?.OnPlaybackRead(
+                                    davItem, bytes, position, stream.CanSeek ? stream.Length : null);
                             },
                             traceRange, readCts, path, ct).ConfigureAwait(false);
                         requestTiming?.TransferEnded();

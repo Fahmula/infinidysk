@@ -63,6 +63,8 @@ export function RepairsSettings({ config, setNewConfig }: RepairsSettingsProps) 
   const isRepairEnabled = parseConfigBoolean(config["repair.enable"]);
   const autoRemoveAfter = config["repair.auto-remove-after-failures"] ?? "0";
   const readHoldMinutes = config["repair.read-hold-minutes"] ?? "15";
+  const isNextEpisodeCheckEnabled = parseConfigBoolean(config["repair.next-episode-check"]);
+  const nextEpisodeCheckPercent = config["repair.next-episode-check-percent"] ?? "50";
   const autoRemoveEnabled = isNonNegativeInteger(autoRemoveAfter) && Number(autoRemoveAfter) > 0;
   const healthcheckDepthIndex = getHealthCheckDepthIndex(
     config["repair.healthcheck-depth"] ?? "standard",
@@ -305,6 +307,66 @@ export function RepairsSettings({ config, setNewConfig }: RepairsSettingsProps) 
                 />
               </Tooltip>
             </div>
+          </ManagedSetting>
+          <ManagedSetting
+            configKeys={["repair.next-episode-check", "repair.next-episode-check-percent"]}
+            className="grid grid-cols-1 gap-4 lg:col-span-2 lg:grid-cols-2"
+          >
+            <div className="space-y-2">
+              <Toggle
+                id="next-episode-check-checkbox"
+                className="cursor-pointer gap-2 p-0"
+                checked={isNextEpisodeCheckEnabled}
+                onChange={(e) =>
+                  setNewConfig({ ...config, "repair.next-episode-check": "" + e.target.checked })
+                }
+                label={
+                  <span className="text-sm text-base-content">
+                    Health-check the next episode during playback
+                  </span>
+                }
+              />
+              <p className="text-[11px] leading-relaxed text-base-content/45">
+                Off by default. While a series episode plays, the next available episode (the next
+                one in the season, or the first one of the next season) is queued for a priority
+                health check, even outside the health-check schedule. A failed check is repaired
+                through the usual PAR2 or Sonarr replacement, within the repair schedule. Episodes
+                are matched by their SxxEyy file or release name.
+              </p>
+            </div>
+            {isNextEpisodeCheckEnabled && (
+              <div className="space-y-2">
+                <label
+                  className="block text-sm font-medium text-base-content"
+                  htmlFor="next-episode-check-percent-input"
+                >
+                  Check Next Episode At (% of current episode)
+                </label>
+                <Input
+                  className={`w-full max-w-48 ${nextEpisodeCheckPercent !== "" && !isIntegerInRange(nextEpisodeCheckPercent, 0, 95) ? "input-error" : ""}`}
+                  type="text"
+                  id="next-episode-check-percent-input"
+                  aria-describedby="next-episode-check-percent-help"
+                  placeholder="50"
+                  value={nextEpisodeCheckPercent}
+                  onChange={(event) =>
+                    setNewConfig({
+                      ...config,
+                      "repair.next-episode-check-percent": event.target.value,
+                    })
+                  }
+                />
+                <p
+                  className="text-[11px] leading-relaxed text-base-content/45"
+                  id="next-episode-check-percent-help"
+                >
+                  How far into the current episode playback must reach before the next episode is
+                  checked. Earlier gives Sonarr more time to replace a bad next episode; later skips
+                  episodes you abandon. Default 50; maximum 95. Set to 0 to check as soon as
+                  playback starts.
+                </p>
+              </div>
+            )}
           </ManagedSetting>
         </SettingsCard>
 
@@ -760,6 +822,9 @@ export function isRepairsSettingsUpdated(
       newConfig["repair.auto-remove-after-failures"] ||
     config["repair.auto-remove-unlinked-only"] !== newConfig["repair.auto-remove-unlinked-only"] ||
     config["repair.read-hold-minutes"] !== newConfig["repair.read-hold-minutes"] ||
+    config["repair.next-episode-check"] !== newConfig["repair.next-episode-check"] ||
+    config["repair.next-episode-check-percent"] !==
+      newConfig["repair.next-episode-check-percent"] ||
     config["repair.par2-enabled"] !== newConfig["repair.par2-enabled"] ||
     config["repair.par2-preferred-over-arr"] !== newConfig["repair.par2-preferred-over-arr"] ||
     config["repair.par2-max-missing-slices"] !== newConfig["repair.par2-max-missing-slices"] ||
@@ -810,6 +875,11 @@ export function isRepairsSettingsValid(newConfig: Record<string, string>) {
   const readHold = newConfig["repair.read-hold-minutes"];
   const readHoldOk =
     readHold === undefined || readHold === "" || isIntegerInRange(readHold, 0, 1440);
+  const nextEpisodePercent = newConfig["repair.next-episode-check-percent"];
+  const nextEpisodePercentOk =
+    nextEpisodePercent === undefined ||
+    nextEpisodePercent === "" ||
+    isIntegerInRange(nextEpisodePercent, 0, 95);
   const bytePercentOk =
     bytePercent === undefined || bytePercent === "" || isPositiveNumber(bytePercent);
   const par2Ok = par2NumericKeys.every((key) => {
@@ -825,6 +895,7 @@ export function isRepairsSettingsValid(newConfig: Record<string, string>) {
     workersOk &&
     autoRemoveOk &&
     readHoldOk &&
+    nextEpisodePercentOk &&
     bytePercentOk &&
     par2Ok &&
     degradedOk &&

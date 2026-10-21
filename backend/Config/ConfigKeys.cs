@@ -116,6 +116,8 @@ public static class ConfigKeys
     public const string RepairPar2FetchConcurrency = "repair.par2-fetch-concurrency";
     public const string RepairPar2FailureCooldownHours = "repair.par2-failure-cooldown-hours";
     public const string RepairReadHoldMinutes = "repair.read-hold-minutes";
+    public const string RepairNextEpisodeCheck = "repair.next-episode-check";
+    public const string RepairNextEpisodeCheckPercent = "repair.next-episode-check-percent";
     public const string RepairDegradedToleranceEnabled = "repair.degraded-tolerance-enabled";
     public const string RepairDegradedMaxConsecutiveMissing = "repair.degraded-max-consecutive-missing";
     public const string RepairDegradedMaxTotalMissing = "repair.degraded-max-total-missing";

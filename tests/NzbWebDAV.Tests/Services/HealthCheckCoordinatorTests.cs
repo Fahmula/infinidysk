@@ -599,6 +599,38 @@ public sealed class HealthCheckCoordinatorTests
         Assert.Empty(harness.Service.InProgressHealthCheckIds);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PriorityRecheck_RunsAheadOfBacklogEvenWhileSchedulesAreClosed(bool schedulesClosed)
+    {
+        using var harness = new Harness(workers: 1, fullySplit: false);
+        await using var connection = await harness.ConfigureEmptyDatabaseAsync();
+        var neverChecked = NewCandidate("never-checked.mkv", null);
+        neverChecked.Path = "/content/tv/never-checked.mkv";
+        var nextEpisode = NewCandidate("next-episode.mkv", DateTimeOffset.UtcNow.AddDays(7));
+        nextEpisode.Path = "/content/tv/next-episode.mkv";
+        await using (var context = harness.Service.CreateDbContextOverride!())
+        {
+            context.Items.AddRange(neverChecked, nextEpisode);
+            await context.SaveChangesAsync();
+        }
+        Assert.Equal(
+            HealthCheckService.FileRecheckOutcome.Queued,
+            await harness.Service.QueueFileRecheckAsync(nextEpisode.Id, CancellationToken.None, priority: true));
+        if (schedulesClosed) harness.CloseHealthSchedules();
+        var blocker = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.Service.ProcessCandidateOverride = (_, ct) => blocker.Task.WaitAsync(ct);
+
+        Assert.Equal(HealthCheckRefillOutcome.Started, await harness.Service.RefillWorkerSlotsAsync(CancellationToken.None));
+        Assert.Equal([nextEpisode.Id], harness.Service.InProgressHealthCheckIds);
+
+        blocker.TrySetResult();
+        await ReapUntilAsync(harness.Service, () => harness.Service.InProgressHealthCheckIds.Count == 0);
+        if (schedulesClosed)
+            Assert.Equal(HealthCheckRefillOutcome.Blocked, await harness.Service.RefillWorkerSlotsAsync(CancellationToken.None));
+    }
+
     [Fact]
     public async Task ManualRun_OpensChecksOnlyUntilDueWorkDrains()
     {

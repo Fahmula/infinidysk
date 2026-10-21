@@ -558,6 +558,10 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
                     RequireLongInRange(item.ConfigName, value, 0, MaximumRepairReadHoldMinutes);
                     break;
 
+                case ConfigKeys.RepairNextEpisodeCheckPercent:
+                    RequireLongInRange(item.ConfigName, value, 0, MaximumNextEpisodeCheckPercent);
+                    break;
+
                 case ConfigKeys.ProwlarrSyncIntervalMinutes:
                     RequireLongInRange(item.ConfigName, value, 5, 10080);
                     break;
@@ -642,6 +646,7 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
                 case ConfigKeys.RepairPar2Enabled:
                 case ConfigKeys.RepairPar2PreferredOverArr:
                 case ConfigKeys.RepairHealthcheckAging:
+                case ConfigKeys.RepairNextEpisodeCheck:
                 case ConfigKeys.RepairAutoRemoveUnlinkedOnly:
                 case ConfigKeys.RcloneRcEnabled:
                 case ConfigKeys.DbIsStartupVacuumEnabled:
@@ -1656,6 +1661,29 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
                 ? value
                 : DefaultRepairReadHoldMinutes;
         return TimeSpan.FromMinutes(minutes);
+    }
+
+    public bool IsNextEpisodeCheckEnabled()
+    {
+        var configValue = StringUtil.EmptyToNull(GetConfigValue(ConfigKeys.RepairNextEpisodeCheck));
+        return configValue != null && bool.Parse(configValue);
+    }
+
+    public const int DefaultNextEpisodeCheckPercent = 50;
+    public const int MaximumNextEpisodeCheckPercent = 95;
+
+    /// <summary>
+    /// How far into the playing episode a sustained read must reach before the next
+    /// episode is health-checked. 0 checks as soon as real playback starts.
+    /// </summary>
+    public int GetNextEpisodeCheckPercent()
+    {
+        var configured = StringUtil.EmptyToNull(GetConfigValue(ConfigKeys.RepairNextEpisodeCheckPercent));
+        return int.TryParse(configured, out var value)
+            && value >= 0
+            && value <= MaximumNextEpisodeCheckPercent
+                ? value
+                : DefaultNextEpisodeCheckPercent;
     }
 
     public string GetRepairPatchStorePath()

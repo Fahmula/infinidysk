@@ -66,6 +66,28 @@ describe("Repairs settings helpers", () => {
     }
   });
 
+  it("validates and detects next-episode check changes", () => {
+    expect(
+      isRepairsSettingsUpdated(baseConfig, { ...baseConfig, "repair.next-episode-check": "true" }),
+    ).toBe(true);
+    expect(
+      isRepairsSettingsUpdated(baseConfig, {
+        ...baseConfig,
+        "repair.next-episode-check-percent": "80",
+      }),
+    ).toBe(true);
+    for (const value of ["0", "50", "95", ""]) {
+      expect(
+        isRepairsSettingsValid({ ...baseConfig, "repair.next-episode-check-percent": value }),
+      ).toBe(true);
+    }
+    for (const value of ["-1", "96", "12.5", "invalid"]) {
+      expect(
+        isRepairsSettingsValid({ ...baseConfig, "repair.next-episode-check-percent": value }),
+      ).toBe(false);
+    }
+  });
+
   it("detects and validates health scheduling changes", () => {
     expect(
       isRepairsSettingsUpdated(baseConfig, {

@@ -33,7 +33,8 @@ public class GetWebdavItemController(
     CandidateNegativeCache negativeCache,
     StreamTraceBuffer streamTrace,
     SharedStreamRegistry sharedStreamRegistry,
-    InFlightArticleBudget? inFlightArticleBudget = null
+    InFlightArticleBudget? inFlightArticleBudget = null,
+    NextEpisodeHealthCheckService? nextEpisodeCheck = null
 ) : ControllerBase
 {
     private async Task<Stream> GetWebdavItem(GetWebdavItemRequest request, CancellationToken ct)
@@ -239,8 +240,8 @@ public class GetWebdavItemController(
                 await using var response = await GetWebdavItem(request, ct).ConfigureAwait(false);
                 if (response == Stream.Null)
                     return;
-                var davItemId =
-                    (HttpContext.Items["DavItem"] as NzbWebDAV.Database.Models.DavItem)?.Id;
+                var davItem = HttpContext.Items["DavItem"] as NzbWebDAV.Database.Models.DavItem;
+                var davItemId = davItem?.Id;
                 activeReadRegistry.RecordFileRead(davItemId);
                 var effectiveStart = (long)(HttpContext.Items["effectiveRangeStart"] ?? 0L);
                 concurrentReadScope.UpdateStart(effectiveStart);
@@ -270,6 +271,9 @@ public class GetWebdavItemController(
                             {
                                 rangeBytesServed += bytes;
                                 activeReadRegistry.RecordFileRead(davItemId);
+                                nextEpisodeCheck?.OnPlaybackRead(
+                                    davItem, bytes, effectiveStart + rangeBytesServed,
+                                    response.CanSeek ? response.Length : null);
                             }, readCts, ct)
                         .ConfigureAwait(false);
                     requestTiming?.TransferEnded();
